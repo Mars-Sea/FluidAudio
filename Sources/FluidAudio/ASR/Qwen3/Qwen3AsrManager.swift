@@ -135,6 +135,10 @@ public actor Qwen3AsrManager {
         melSpectrogram: [[Float]],
         models: Qwen3AsrModels
     ) throws -> [[Float]] {
+        // 8 秒窗口编码器（输入含 key_mask）：与原模型 n_window_infer=800 一致的注意力范围
+        if models.audioEncoder.modelDescription.inputDescriptionsByName["key_mask"] != nil {
+            return try encodeAudioWindowed(melSpectrogram: melSpectrogram, models: models)
+        }
         let windowSize = Qwen3AsrConfig.melWindowSize
         let numFrames = melSpectrogram.first?.count ?? 0
 
@@ -178,6 +182,62 @@ public actor Qwen3AsrManager {
             offset += windowSize
         }
 
+        return allFeatures
+    }
+
+    /// 按 800 帧（8 个 100 帧分块）为一个注意力窗口调用编码器。
+    /// 每块独立卷积、窗口内整体注意力；尾部不足部分以 0 填充并通过 key_mask 屏蔽，
+    /// 输出只取每块的有效 token（三次 stride-2 卷积后的长度），与 transformers 原版逐值等价。
+    private func encodeAudioWindowed(
+        melSpectrogram: [[Float]],
+        models: Qwen3AsrModels
+    ) throws -> [[Float]] {
+        let chunkFrames = Qwen3AsrConfig.melWindowSize
+        let chunksPerWindow = 8
+        let tokensPerChunk = Qwen3AsrConfig.outputFramesPerWindow
+        let windowFrames = chunkFrames * chunksPerWindow
+        let tokensPerWindow = tokensPerChunk * chunksPerWindow
+        let numFrames = melSpectrogram.first?.count ?? 0
+        let dim = Qwen3AsrConfig.encoderOutputDim
+
+        func postCNNLength(_ n: Int) -> Int {
+            var v = n
+            for _ in 0..<3 { v = v > 0 ? (v - 1) / 2 + 1 : 0 }
+            return v
+        }
+
+        var allFeatures: [[Float]] = []
+        var offset = 0
+        while offset < numFrames {
+            let valid = min(windowFrames, numFrames - offset)
+            let melProvider = try createMelInput(
+                melSpectrogram: melSpectrogram, offset: offset, windowSize: valid, padTo: windowFrames)
+            let mask = try MLMultiArray(shape: [1, NSNumber(value: tokensPerWindow)], dataType: .float32)
+            let maskPtr = mask.dataPointer.bindMemory(to: Float.self, capacity: tokensPerWindow)
+            maskPtr.initialize(repeating: -1e4, count: tokensPerWindow)
+            var counts: [Int] = []
+            for c in 0..<chunksPerWindow {
+                let k = postCNNLength(max(0, min(chunkFrames, valid - c * chunkFrames)))
+                counts.append(k)
+                for j in 0..<k { maskPtr[c * tokensPerChunk + j] = 0 }
+            }
+            var dict: [String: MLFeatureValue] = [:]
+            for name in melProvider.featureNames { dict[name] = melProvider.featureValue(for: name) }
+            dict["key_mask"] = MLFeatureValue(multiArray: mask)
+            let prediction = try models.audioEncoder.prediction(from: MLDictionaryFeatureProvider(dictionary: dict))
+            guard let features = prediction.featureValue(for: "audio_features")?.multiArrayValue else {
+                throw Qwen3AsrError.encoderFailed("No audio_features output")
+            }
+            for (c, k) in counts.enumerated() {
+                for j in 0..<k {
+                    let base = (c * tokensPerChunk + j) * dim
+                    var vec = [Float](repeating: 0, count: dim)
+                    for d in 0..<dim { vec[d] = features[base + d].floatValue }
+                    allFeatures.append(vec)
+                }
+            }
+            offset += windowFrames
+        }
         return allFeatures
     }
 
