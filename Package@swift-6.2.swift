@@ -2,11 +2,11 @@
 import PackageDescription
 import Foundation
 
-// Tools 6.2+ manifest: identical to Package.swift plus the `NemoTextProcessing`
-// trait. Keep the two in sync; Package.swift serves toolchains < 6.2, which
-// always link the engine. (SwiftPM 6.1 accepts the trait syntax but still
-// links a trait-conditioned binary target — verified on Xcode 16.4 — so the
-// opt-out is gated at 6.2.)
+// GotIt fork: Tools 6.2+ manifest kept identical to Package.swift.
+// The NemoTextProcessing engine (prebuilt Rust staticlib, ~28 MB for iOS arm64)
+// is removed in this fork because GotIt only uses ASR; FluidAudio's
+// `canImport(CNemoTextProcessing)` guards make TTS frontends and
+// `TextNormalizer` pass text through unchanged without it.
 
 let package = Package(
     name: "FluidAudio",
@@ -25,19 +25,6 @@ let package = Package(
             targets: ["FluidAudioCLI"]
         ),
     ],
-    traits: [
-        // Opt out of the NeMo text-normalization engine (~8 MB per slice, a prebuilt
-        // Rust staticlib) for ASR/VAD/diarization-only apps, or when the app
-        // links its own Rust runtime (#880, #888):
-        //   .package(url: ..., traits: [])
-        // TTS frontends and `TextNormalizer` then pass text through unchanged
-        // and report `isNativeAvailable == false`.
-        .trait(
-            name: "NemoTextProcessing",
-            description: "Link the bundled NeMo text-normalization engine (TTS frontends, ITN)."
-        ),
-        .default(enabledTraits: ["NemoTextProcessing"]),
-    ],
     dependencies: [],
     targets: [
         .target(
@@ -45,11 +32,6 @@ let package = Package(
             dependencies: [
                 "FastClusterWrapper",
                 "MachTaskSelfWrapper",
-                // The prebuilt xcframework has no visionOS slice.
-                .target(
-                    name: "NemoTextProcessing",
-                    condition: .when(platforms: [.macOS, .iOS, .macCatalyst], traits: ["NemoTextProcessing"])
-                ),
             ],
             path: "Sources/FluidAudio",
             exclude: ["ASR/Parakeet/Unified/benchmark.md"],
@@ -57,15 +39,6 @@ let package = Package(
                 // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
                 .process("TTS/LuxTts/G2p/Resources")
             ]
-        ),
-        // Byte-exact NeMo text normalization (FST engine, all 7 languages).
-        // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.1
-        // (macOS, iOS, iOS Simulator and Mac Catalyst slices).
-        .binaryTarget(
-            name: "NemoTextProcessing",
-            url:
-                "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.1/NemoTextProcessing.xcframework.zip",
-            checksum: "5fa8c10d4ec26c1bb2413125f351a7222a4c68a23b74476680fbada7e26fc6aa"
         ),
         .target(
             name: "FastClusterWrapper",
