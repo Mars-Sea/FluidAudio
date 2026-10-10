@@ -2,11 +2,11 @@
 import PackageDescription
 import Foundation
 
-// Tools 6.2+ manifest: identical to Package.swift plus the `NemoTextProcessing`,
-// `TTS` and `Diarizer` traits. Keep the two in sync; Package.swift serves
-// toolchains < 6.2, which always link the engine and compile every subsystem. (SwiftPM 6.1 accepts the trait syntax but still
-// links a trait-conditioned binary target — verified on Xcode 16.4 — so the
-// opt-out is gated at 6.2.)
+// GotIt fork: Tools 6.2+ manifest, identical to Package.swift plus the `TTS`
+// and `Diarizer` traits. Keep the two in sync.
+// The NemoTextProcessing engine (prebuilt Rust staticlib, ~28 MB for iOS arm64)
+// is removed in this fork; FluidAudio's `canImport(CNemoTextProcessing)` guards
+// make TTS frontends and `TextNormalizer` pass text through unchanged without it.
 
 let package = Package(
     name: "FluidAudio",
@@ -27,16 +27,6 @@ let package = Package(
         ),
     ],
     traits: [
-        // Opt out of the NeMo text-normalization engine (~8 MB per slice, a prebuilt
-        // Rust staticlib) for ASR/VAD/diarization-only apps, or when the app
-        // links its own Rust runtime (#880, #888):
-        //   .package(url: ..., traits: [])
-        // TTS frontends and `TextNormalizer` then pass text through unchanged
-        // and report `isNativeAvailable == false`.
-        .trait(
-            name: "NemoTextProcessing",
-            description: "Link the bundled NeMo text-normalization engine (TTS frontends, ITN)."
-        ),
         // Opt out of whole subsystems for apps that never reach them (#990):
         //   .package(url: ..., traits: [])            // ASR/VAD only
         //   .package(url: ..., traits: ["Diarizer"])  // ASR/VAD + diarization
@@ -48,7 +38,7 @@ let package = Package(
             name: "Diarizer",
             description: "Speaker diarization (pyannote, Sortformer, LS-EEND, Nemotron 3)."
         ),
-        .default(enabledTraits: ["NemoTextProcessing", "TTS", "Diarizer"]),
+        .default(enabledTraits: ["TTS", "Diarizer"]),
     ],
     dependencies: [],
     targets: [
@@ -57,11 +47,6 @@ let package = Package(
             dependencies: [
                 "FastClusterWrapper",
                 "MachTaskSelfWrapper",
-                // The prebuilt xcframework has no visionOS or tvOS slice.
-                .target(
-                    name: "NemoTextProcessing",
-                    condition: .when(platforms: [.macOS, .iOS, .macCatalyst], traits: ["NemoTextProcessing"])
-                ),
                 .target(name: "LuxTtsG2pResources", condition: .when(traits: ["TTS"])),
             ],
             path: "Sources/FluidAudio",
@@ -75,15 +60,6 @@ let package = Package(
                 // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
                 .process("Resources")
             ]
-        ),
-        // Byte-exact NeMo text normalization (FST engine, all 7 languages).
-        // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.1
-        // (macOS, iOS, iOS Simulator and Mac Catalyst slices).
-        .binaryTarget(
-            name: "NemoTextProcessing",
-            url:
-                "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.1/NemoTextProcessing.xcframework.zip",
-            checksum: "5fa8c10d4ec26c1bb2413125f351a7222a4c68a23b74476680fbada7e26fc6aa"
         ),
         .target(
             name: "FastClusterWrapper",
