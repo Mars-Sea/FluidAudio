@@ -156,27 +156,30 @@ public actor Qwen3AsrManager {
                 padTo: windowSize
             )
 
-            let prediction = try models.audioEncoder.prediction(from: melInput)
-            guard let features = prediction.featureValue(for: "audio_features")?.multiArrayValue else {
-                throw Qwen3AsrError.encoderFailed("No audio_features output")
-            }
-
-            let numOutputFrames: Int
-            if currentWindowSize == windowSize {
-                numOutputFrames = Qwen3AsrConfig.outputFramesPerWindow
-            } else {
-                numOutputFrames =
-                    (currentWindowSize + Qwen3AsrConfig.convDownsampleFactor - 1)
-                    / Qwen3AsrConfig.convDownsampleFactor
-            }
-
-            for f in 0..<numOutputFrames {
-                var vec = [Float](repeating: 0.0, count: Qwen3AsrConfig.encoderOutputDim)
-                for d in 0..<Qwen3AsrConfig.encoderOutputDim {
-                    let idx = f * Qwen3AsrConfig.encoderOutputDim + d
-                    vec[d] = features[idx].floatValue
+            try autoreleasepool {
+                let prediction = try models.audioEncoder.prediction(from: melInput)
+                guard let features = prediction.featureValue(for: "audio_features")?.multiArrayValue else {
+                    throw Qwen3AsrError.encoderFailed("No audio_features output")
                 }
-                allFeatures.append(vec)
+
+                let numOutputFrames: Int
+                if currentWindowSize == windowSize {
+                    numOutputFrames = Qwen3AsrConfig.outputFramesPerWindow
+                } else {
+                    numOutputFrames =
+                        (currentWindowSize + Qwen3AsrConfig.convDownsampleFactor - 1)
+                        / Qwen3AsrConfig.convDownsampleFactor
+                }
+
+                for f in 0..<numOutputFrames {
+                    var vec = [Float](repeating: 0.0, count: Qwen3AsrConfig.encoderOutputDim)
+                    for d in 0..<Qwen3AsrConfig.encoderOutputDim {
+                        let idx = f * Qwen3AsrConfig.encoderOutputDim + d
+                        vec[d] = features[idx].floatValue
+                    }
+                    allFeatures.append(vec)
+                }
+
             }
 
             offset += windowSize
@@ -224,16 +227,18 @@ public actor Qwen3AsrManager {
             var dict: [String: MLFeatureValue] = [:]
             for name in melProvider.featureNames { dict[name] = melProvider.featureValue(for: name) }
             dict["key_mask"] = MLFeatureValue(multiArray: mask)
-            let prediction = try models.audioEncoder.prediction(from: MLDictionaryFeatureProvider(dictionary: dict))
-            guard let features = prediction.featureValue(for: "audio_features")?.multiArrayValue else {
-                throw Qwen3AsrError.encoderFailed("No audio_features output")
-            }
-            for (c, k) in counts.enumerated() {
-                for j in 0..<k {
-                    let base = (c * tokensPerChunk + j) * dim
-                    var vec = [Float](repeating: 0, count: dim)
-                    for d in 0..<dim { vec[d] = features[base + d].floatValue }
-                    allFeatures.append(vec)
+            try autoreleasepool {
+                let prediction = try models.audioEncoder.prediction(from: MLDictionaryFeatureProvider(dictionary: dict))
+                guard let features = prediction.featureValue(for: "audio_features")?.multiArrayValue else {
+                    throw Qwen3AsrError.encoderFailed("No audio_features output")
+                }
+                for (c, k) in counts.enumerated() {
+                    for j in 0..<k {
+                        let base = (c * tokensPerChunk + j) * dim
+                        var vec = [Float](repeating: 0, count: dim)
+                        for d in 0..<dim { vec[d] = features[base + d].floatValue }
+                        allFeatures.append(vec)
+                    }
                 }
             }
             offset += windowFrames
@@ -386,22 +391,41 @@ public actor Qwen3AsrManager {
         // ---- Prefill ----
         let prefillStart = CFAbsoluteTimeGetCurrent()
 
-        let (prefillCos, prefillSin) = rope.computeRange(startPosition: 0, count: promptLength)
-        let hiddenArray = try createBatchedHiddenArray(
-            embeddings: Array(initialEmbeddings[0..<promptLength])
-        )
-        let cosArray = try createBatchedPositionArray(values: prefillCos, seqLen: promptLength)
-        let sinArray = try createBatchedPositionArray(values: prefillSin, seqLen: promptLength)
-        let prefillMask = try createPrefillMask(seqLen: promptLength)
-
-        let prefillLogits = try runStatefulDecoder(
-            hiddenStates: hiddenArray,
-            positionCos: cosArray,
-            positionSin: sinArray,
-            mask: prefillMask,
-            state: state,
-            models: models
-        )
+        // 分段预填充：GPU（MPSGraph）对每个新的查询长度 Q 都会编译并常驻一份图（实测约 300MB），
+        // 流式重转写每次提示词长度都不同，内存会随更新次数线性上涨直至被系统终止。
+        // 因此只使用固定的 Q=prefillChunkSize（不足一段时为 Q=1）：按段写入 KV 缓存，
+        // 最后一段向前对齐到提示词末尾，与上一段重叠的位置用相同 token 和上下文重算，写回值不变。
+        // 解码器按掩码最后一行推导位置，分段与一次性预填充数值等价。
+        let chunkSize = Self.prefillChunkSize
+        var firstTokenId = 0
+        var written = 0
+        while written < promptLength {
+            let q = promptLength >= chunkSize ? chunkSize : 1
+            let chunkStart = promptLength >= chunkSize ? min(written, promptLength - chunkSize) : written
+            let (chunkCos, chunkSin) = rope.computeRange(startPosition: chunkStart, count: q)
+            let hiddenArray = try createBatchedHiddenArray(
+                embeddings: Array(initialEmbeddings[chunkStart..<(chunkStart + q)])
+            )
+            let cosArray = try createBatchedPositionArray(values: chunkCos, seqLen: q)
+            let sinArray = try createBatchedPositionArray(values: chunkSin, seqLen: q)
+            let chunkMask = try createChunkMask(queryLength: q, endStep: chunkStart + q)
+            // 每次 prediction 的输出是自动释放对象，长期运行的 async 任务里需显式排空
+            let tokenId = try autoreleasepool {
+                let logits = try runStatefulDecoder(
+                    hiddenStates: hiddenArray,
+                    positionCos: cosArray,
+                    positionSin: sinArray,
+                    mask: chunkMask,
+                    state: state,
+                    models: models
+                )
+                return argmaxFromLogits(logits)
+            }
+            written = chunkStart + q
+            if written == promptLength {
+                firstTokenId = tokenId
+            }
+        }
 
         currentPosition = promptLength
 
@@ -425,8 +449,6 @@ public actor Qwen3AsrManager {
             to: Float.self, capacity: Qwen3AsrConfig.headDim
         )
 
-        // Get first token from prefill logits
-        let firstTokenId = argmaxFromLogits(prefillLogits)
         if !Qwen3AsrConfig.eosTokenIds.contains(firstTokenId) {
             generatedTokens.append(firstTokenId)
         }
@@ -454,18 +476,19 @@ public actor Qwen3AsrManager {
             let endStep = currentPosition + 1
             let mask = try createDecodeMask(endStep: endStep)
 
-            let logits = try runStatefulDecoder(
-                hiddenStates: decHiddenArray,
-                positionCos: decodeCosArray,
-                positionSin: decodeSinArray,
-                mask: mask,
-                state: state,
-                models: models
-            )
+            let tokenId = try autoreleasepool {
+                let logits = try runStatefulDecoder(
+                    hiddenStates: decHiddenArray,
+                    positionCos: decodeCosArray,
+                    positionSin: decodeSinArray,
+                    mask: mask,
+                    state: state,
+                    models: models
+                )
+                return argmaxFromLogits(logits)
+            }
 
             currentPosition += 1
-
-            let tokenId = argmaxFromLogits(logits)
 
             if Qwen3AsrConfig.eosTokenIds.contains(tokenId) {
                 break
@@ -569,15 +592,16 @@ public actor Qwen3AsrManager {
 
     // MARK: - MLMultiArray Helpers
 
-    private func createPrefillMask(seqLen: Int) throws -> MLMultiArray {
-        let shape: [NSNumber] = [1, 1, NSNumber(value: seqLen), NSNumber(value: seqLen)]
+    /// 分段预填充的单段大小；与 Q=1 一起构成 GPU 上仅有的两种查询长度。
+    static let prefillChunkSize = 32
+
+    /// 分段预填充掩码 [1, 1, Q, endStep]，全 0。解码器只读最后一行可见数推导位置，
+    /// 因果关系由其内部按位置重建；宽度变化不会触发 GPU 重新编译。
+    private func createChunkMask(queryLength: Int, endStep: Int) throws -> MLMultiArray {
+        let shape: [NSNumber] = [1, 1, NSNumber(value: queryLength), NSNumber(value: endStep)]
         let array = try MLMultiArray(shape: shape, dataType: .float32)
-        let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: seqLen * seqLen)
-        for i in 0..<seqLen {
-            for j in 0..<seqLen {
-                ptr[i * seqLen + j] = j > i ? Float(-1e9) : 0.0
-            }
-        }
+        let ptr = array.dataPointer.bindMemory(to: Float.self, capacity: queryLength * endStep)
+        ptr.initialize(repeating: 0, count: queryLength * endStep)
         return array
     }
 
