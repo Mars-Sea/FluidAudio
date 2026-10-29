@@ -36,8 +36,8 @@ let package = Package(
             exclude: ["ASR/Parakeet/Unified/benchmark.md"],
             swiftSettings: [
                 // Package@swift-6.2.swift exposes these as opt-out traits (#990).
+                // GotIt fork: Diarizer is off (GotIt never uses speaker diarization).
                 .define("TTS"),
-                .define("Diarizer"),
             ]
         ),
         .target(

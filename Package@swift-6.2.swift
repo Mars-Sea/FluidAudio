@@ -38,7 +38,8 @@ let package = Package(
             name: "Diarizer",
             description: "Speaker diarization (pyannote, Sortformer, LS-EEND, Nemotron 3)."
         ),
-        .default(enabledTraits: ["TTS", "Diarizer"]),
+        // GotIt fork: Diarizer is off by default (GotIt never uses speaker diarization).
+        .default(enabledTraits: ["TTS"]),
     ],
     dependencies: [],
     targets: [
